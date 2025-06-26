@@ -1,6 +1,7 @@
 """Clean Kokoro implementation with controlled resource management."""
 
 import os
+from functools import lru_cache
 from typing import AsyncGenerator, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -15,6 +16,21 @@ from ..structures.schemas import WordTimestamp
 from .base import AudioChunk, BaseModelBackend
 
 
+class OptimizedKPipeline(KPipeline):
+    def load_voice(self, voice: Union[str, torch.Tensor], delimiter: str = ",") -> torch.Tensor:
+        # For gpu tensor, FloatTensor is not supported
+        if isinstance(voice, torch.Tensor):
+            return voice
+        if voice in self.voices:
+            return self.voices[voice]
+        logger.debug(f"Loading voice: {voice}")
+        packs = [self.load_single_voice(v) for v in voice.split(delimiter)]
+        if len(packs) == 1:
+            return packs[0]
+        self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
+        return self.voices[voice]
+
+
 class KokoroV1(BaseModelBackend):
     """Kokoro backend with controlled resource management."""
 
@@ -24,7 +40,10 @@ class KokoroV1(BaseModelBackend):
         # Strictly respect settings.use_gpu
         self._device = settings.get_device()
         self._model: Optional[KModel] = None
-        self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
+        self._pipelines: Dict[str, OptimizedKPipeline] = {}  # Store pipelines by lang_code
+        # Cache for voice tensors - key: voice_name, value: tensor
+        self._voice_cache: Dict[str, torch.Tensor] = {}
+        self._voice_cache_size = 50  # Maximum number of cached voices
 
     async def load_model(self, path: str) -> None:
         """Load pre-baked model.
@@ -65,21 +84,21 @@ class KokoroV1(BaseModelBackend):
         except Exception as e:
             raise RuntimeError(f"Failed to load Kokoro model: {e}")
 
-    def _get_pipeline(self, lang_code: str) -> KPipeline:
+    def _get_pipeline(self, lang_code: str) -> OptimizedKPipeline:
         """Get or create pipeline for language code.
 
         Args:
             lang_code: Language code to use
 
         Returns:
-            KPipeline instance for the language
+            OptimizedKPipeline instance for the language
         """
         if not self._model:
             raise RuntimeError("Model not loaded")
 
         if lang_code not in self._pipelines:
             logger.info(f"Creating new pipeline for language code: {lang_code}")
-            self._pipelines[lang_code] = KPipeline(
+            self._pipelines[lang_code] = OptimizedKPipeline(
                 lang_code=lang_code, model=self._model, device=self._device
             )
         return self._pipelines[lang_code]
@@ -114,38 +133,23 @@ class KokoroV1(BaseModelBackend):
                 if self._check_memory():
                     self._clear_memory()
 
-            # Handle voice input
-            voice_path: str
+            # Handle voice input with caching
+            voice_tensor: torch.Tensor
             voice_name: str
             if isinstance(voice, tuple):
                 voice_name, voice_data = voice
                 if isinstance(voice_data, str):
-                    voice_path = voice_data
+                    # Use cached voice tensor
+                    voice_tensor = await self._get_cached_voice_tensor(voice_name, voice_data)
                 else:
-                    # Save tensor to temporary file
-                    import tempfile
-
-                    temp_dir = tempfile.gettempdir()
-                    voice_path = os.path.join(temp_dir, f"{voice_name}.pt")
-                    # Save tensor with CPU mapping for portability
-                    torch.save(voice_data.cpu(), voice_path)
+                    # Use tensor directly, ensuring it's on the correct device
+                    voice_tensor = voice_data.to(self._device)
+                    # Cache the tensor for future use
+                    self._voice_cache[voice_name] = voice_tensor
             else:
-                voice_path = voice
-                voice_name = os.path.splitext(os.path.basename(voice_path))[0]
-
-            # Load voice tensor with proper device mapping
-            voice_tensor = await paths.load_voice_tensor(
-                voice_path, device=self._device
-            )
-            # Save back to a temporary file with proper device mapping
-            import tempfile
-
-            temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(
-                temp_dir, f"temp_voice_{os.path.basename(voice_path)}"
-            )
-            await paths.save_voice_tensor(voice_tensor, temp_path)
-            voice_path = temp_path
+                voice_name = os.path.splitext(os.path.basename(voice))[0]
+                # Use cached voice tensor
+                voice_tensor = await self._get_cached_voice_tensor(voice_name, voice)
 
             # Use provided lang_code, settings voice code override, or first letter of voice name
             if lang_code:  # api is given priority
@@ -161,7 +165,7 @@ class KokoroV1(BaseModelBackend):
                 f"Generating audio from tokens with lang_code '{pipeline_lang_code}': '{tokens[:100]}{'...' if len(tokens) > 100 else ''}'"
             )
             for result in pipeline.generate_from_tokens(
-                tokens=tokens, voice=voice_path, speed=speed, model=self._model
+                tokens=tokens, voice=voice_tensor, speed=speed, model=self._model
             ):
                 if result.audio is not None:
                     logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
@@ -213,38 +217,23 @@ class KokoroV1(BaseModelBackend):
                 if self._check_memory():
                     self._clear_memory()
 
-            # Handle voice input
-            voice_path: str
+            # Handle voice input with caching
+            voice_tensor: torch.Tensor
             voice_name: str
             if isinstance(voice, tuple):
                 voice_name, voice_data = voice
                 if isinstance(voice_data, str):
-                    voice_path = voice_data
+                    # Use cached voice tensor
+                    voice_tensor = await self._get_cached_voice_tensor(voice_name, voice_data)
                 else:
-                    # Save tensor to temporary file
-                    import tempfile
-
-                    temp_dir = tempfile.gettempdir()
-                    voice_path = os.path.join(temp_dir, f"{voice_name}.pt")
-                    # Save tensor with CPU mapping for portability
-                    torch.save(voice_data.cpu(), voice_path)
+                    # Use tensor directly, ensuring it's on the correct device
+                    voice_tensor = voice_data.to(self._device)
+                    # Cache the tensor for future use
+                    self._voice_cache[voice_name] = voice_tensor
             else:
-                voice_path = voice
-                voice_name = os.path.splitext(os.path.basename(voice_path))[0]
-
-            # Load voice tensor with proper device mapping
-            voice_tensor = await paths.load_voice_tensor(
-                voice_path, device=self._device
-            )
-            # Save back to a temporary file with proper device mapping
-            import tempfile
-
-            temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(
-                temp_dir, f"temp_voice_{os.path.basename(voice_path)}"
-            )
-            await paths.save_voice_tensor(voice_tensor, temp_path)
-            voice_path = temp_path
+                voice_name = os.path.splitext(os.path.basename(voice))[0]
+                # Use cached voice tensor
+                voice_tensor = await self._get_cached_voice_tensor(voice_name, voice)
 
             # Use provided lang_code, settings voice code override, or first letter of voice name
             pipeline_lang_code = (
@@ -262,7 +251,7 @@ class KokoroV1(BaseModelBackend):
                 f"Generating audio for text with lang_code '{pipeline_lang_code}': '{text[:100]}{'...' if len(text) > 100 else ''}'"
             )
             for result in pipeline(
-                text, voice=voice_path, speed=speed, model=self._model
+                text, voice=voice_tensor, speed=speed, model=self._model
             ):
                 if result.audio is not None:
                     logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
@@ -355,6 +344,8 @@ class KokoroV1(BaseModelBackend):
         for pipeline in self._pipelines.values():
             del pipeline
         self._pipelines.clear()
+        # Clear voice cache
+        self._voice_cache.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -368,3 +359,56 @@ class KokoroV1(BaseModelBackend):
     def device(self) -> str:
         """Get device model is running on."""
         return self._device
+
+    async def _get_cached_voice_tensor(self, voice_name: str, voice_path: str) -> torch.Tensor:
+        """Get voice tensor from cache or load and cache it.
+        
+        Args:
+            voice_name: Name of the voice for cache key
+            voice_path: Path to the voice file
+            
+        Returns:
+            Voice tensor on the correct device
+        """
+        # Check if voice is already cached
+        if voice_name in self._voice_cache:
+            logger.debug(f"Using cached voice tensor for: {voice_name}")
+            return self._voice_cache[voice_name]
+        
+        # If cache is full, remove oldest entry (simple FIFO for now)
+        if len(self._voice_cache) >= self._voice_cache_size:
+            oldest_key = next(iter(self._voice_cache))
+            logger.debug(f"Voice cache full, removing: {oldest_key}")
+            del self._voice_cache[oldest_key]
+        
+        # Load voice tensor asynchronously
+        voice_tensor = await paths.load_voice_tensor(voice_path, device=self._device)
+        
+        # Cache the tensor
+        self._voice_cache[voice_name] = voice_tensor
+        logger.debug(f"Cached voice tensor for: {voice_name}")
+        
+        return voice_tensor
+
+    def get_voice_cache_info(self) -> Dict[str, Union[int, float]]:
+        """Get voice cache statistics.
+        
+        Returns:
+            Dictionary with cache statistics
+        """
+        cache_size_mb = 0.0
+        for tensor in self._voice_cache.values():
+            # Estimate tensor size in MB
+            cache_size_mb += tensor.numel() * tensor.element_size() / (1024 * 1024)
+        
+        return {
+            "cached_voices": len(self._voice_cache),
+            "max_cache_size": self._voice_cache_size,
+            "cache_size_mb": round(cache_size_mb, 2),
+            "cache_utilization": len(self._voice_cache) / self._voice_cache_size
+        }
+
+    def clear_voice_cache(self) -> None:
+        """Clear the voice tensor cache."""
+        logger.info(f"Clearing voice cache with {len(self._voice_cache)} entries")
+        self._voice_cache.clear()
