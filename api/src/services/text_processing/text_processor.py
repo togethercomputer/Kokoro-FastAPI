@@ -2,7 +2,7 @@
 
 import re
 import time
-from typing import AsyncGenerator, Dict, List, Tuple, Optional
+from typing import AsyncGenerator, Dict, Generator, List, Tuple, Optional
 
 from loguru import logger
 
@@ -101,7 +101,7 @@ def process_text(text: str, language: str = "a") -> List[int]:
 
 def get_sentence_info(
     text: str, custom_phenomes_list: Dict[str, str], lang_code: str = "a"
-) -> List[Tuple[str, List[int], int]]:
+) -> Generator[Tuple[str, List[int], int], None, None]:
     """Process all sentences and return info"""
     # Detect Chinese text
     is_chinese = lang_code.startswith("z") or re.search(r"[\u4e00-\u9fff]", text)
@@ -112,7 +112,6 @@ def get_sentence_info(
         sentences = re.split(r"([.!?;:])(?=\s|$)", text)
     phoneme_length, min_value = len(custom_phenomes_list), 0
 
-    results = []
     for i in range(0, len(sentences), 2):
         sentence = sentences[i].strip()
         for replaced in range(min_value, phoneme_length):
@@ -131,8 +130,7 @@ def get_sentence_info(
         if not full:  # Skip if empty after stripping
             continue
         tokens = process_text_chunk(full)
-        results.append((full, tokens, len(tokens)))
-    return results
+        yield full, tokens, len(tokens)
 
 
 def handle_custom_phonemes(s: re.Match[str], phenomes_list: Dict[str, str]) -> str:
