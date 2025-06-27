@@ -24,6 +24,21 @@ from .text_processing import tokenize
 from .text_processing.text_processor import process_text_chunk, smart_split
 
 
+activities = [
+    torch.profiler.ProfilerActivity.CPU,
+    torch.profiler.ProfilerActivity.CUDA,
+    torch.profiler.ProfilerActivity.XPU,
+]
+
+class EmptyProfiler:
+    def start(self):
+        pass
+    def stop(self):
+        pass
+    def export_chrome_trace(self, _):
+        pass
+
+
 class TTSService:
     """Text-to-speech service."""
 
@@ -35,6 +50,15 @@ class TTSService:
         self.output_dir = output_dir
         self.model_manager = None
         self._voice_manager = None
+        if os.environ.get("PROFILE_TORCH", "0") == "1":
+            self.torch_profiler = torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                with_modules=True
+            )
+        else:
+            self.torch_profiler = EmptyProfiler()
+        self.profile_iters = 0
 
     @classmethod
     async def create(cls, output_dir: str = None) -> "TTSService":
@@ -271,6 +295,9 @@ class TTSService:
         stream_normalizer = AudioNormalizer()
         chunk_index = 0
         current_offset = 0.0
+        if not self.profile_iters:
+            self.torch_profiler.start()
+            self.profile_iters += 1
         try:
             # Get backend
             backend = self.model_manager.get_backend()
@@ -392,6 +419,9 @@ class TTSService:
                             yield chunk_data
                 except Exception as e:
                     logger.error(f"Failed to finalize audio stream: {str(e)}")
+
+            self.torch_profiler.stop()
+            self.torch_profiler.export_chrome_trace(f"torch_trace_{self.profile_iters}.json.gz")
 
         except Exception as e:
             logger.error(f"Error in phoneme audio generation: {str(e)}")
