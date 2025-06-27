@@ -125,28 +125,10 @@ class TTSService:
                         speed=speed,
                         lang_code=lang_code,
                         return_timestamps=return_timestamps,
+                        output_format=output_format,
+                        volume_multiplier=volume_multiplier,
                     ):
-                        chunk_data.audio*=volume_multiplier
-                        # For streaming, convert to bytes
-                        if output_format:
-                            try:
-                                chunk_data = await AudioService.convert_audio(
-                                    chunk_data,
-                                    output_format,
-                                    writer,
-                                    speed,
-                                    chunk_text,
-                                    is_last_chunk=is_last,
-                                    normalizer=normalizer,
-                                )
-                                yield chunk_data
-                            except Exception as e:
-                                logger.error(f"Failed to convert audio: {str(e)}")
-                        else:
-                            chunk_data = AudioService.trim_audio(
-                                chunk_data, chunk_text, speed, is_last, normalizer
-                            )
-                            yield chunk_data
+                        yield chunk_data
                         chunk_index += 1
                 else:
                     # For legacy backends, load voice tensor
@@ -292,9 +274,8 @@ class TTSService:
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Generate and stream audio chunks."""
+        """Generate and stream audio chunks with low-latency pipelined processing."""
         stream_normalizer = AudioNormalizer()
-        chunk_index = 0
         current_offset = 0.0
         if not self.profile_iters:
             self.torch_profiler.start()
@@ -313,119 +294,148 @@ class TTSService:
                 f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream"
             )
 
-            # Process text in chunks with smart splitting, handling pause tags
-            async for chunk_text, tokens, pause_duration_s in smart_split(
-                text,
-                lang_code=pipeline_lang_code,
-                normalization_options=normalization_options,
-            ):
-                if pause_duration_s is not None and pause_duration_s > 0:
-                    # --- Handle Pause Chunk ---
-                    try:
-                        logger.debug(f"Generating {pause_duration_s}s silence chunk")
-                        silence_samples = int(pause_duration_s * 24000)  # 24kHz sample rate
-                        # Create proper silence as int16 zeros to avoid normalization artifacts
-                        silence_audio = np.zeros(silence_samples, dtype=np.int16)
-                        pause_chunk = AudioChunk(audio=silence_audio, word_timestamps=[])  # Empty timestamps for silence
-
-                        # Format and yield the silence chunk
-                        if output_format:
-                            formatted_pause_chunk = await AudioService.convert_audio(
-                                pause_chunk, output_format, writer, speed=speed, chunk_text="",
-                                is_last_chunk=False, trim_audio=False, normalizer=stream_normalizer,
-
-                            )
-                            if formatted_pause_chunk.output:
-                                yield formatted_pause_chunk
-                        else:  # Raw audio mode
-                            # For raw audio mode, silence is already in the correct format (int16)
-                            # Skip normalization to avoid any potential artifacts
-                            if len(pause_chunk.audio) > 0:
-                                yield pause_chunk
-
-                        # Update offset based on silence duration
-                        current_offset += pause_duration_s
-                        chunk_index += 1  # Count pause as a yielded chunk
-
-                    except Exception as e:
-                        logger.error(f"Failed to process pause chunk: {str(e)}")
-                        continue
-
-                elif tokens or chunk_text.strip():  # Process if there are tokens OR non-whitespace text
-                    # --- Handle Text Chunk ---
-                    try:
-                        # Process audio for chunk
-                        async for chunk_data in self._process_chunk(
-                            chunk_text,  # Pass text for Kokoro V1
-                            tokens,  # Pass tokens for legacy backends
-                            voice_name,  # Pass voice name
-                            voice_path,  # Pass voice path
-                            speed,
-                            writer,
-                            output_format,
-                            is_first=(chunk_index == 0),
-                            volume_multiplier=volume_multiplier,
-                            is_last=False,  # We'll update the last chunk later
-                            normalizer=stream_normalizer,
-                            lang_code=pipeline_lang_code,  # Pass lang_code
-                            return_timestamps=return_timestamps,
-                        ):
-                            if chunk_data.word_timestamps is not None:
-                                for timestamp in chunk_data.word_timestamps:
-                                    timestamp.start_time += current_offset
-                                    timestamp.end_time += current_offset
-
-                            # Update offset based on the actual duration of the generated audio chunk
-                            chunk_duration = 0
-                            if chunk_data.audio is not None and len(chunk_data.audio) > 0:
-                                chunk_duration = len(chunk_data.audio) / 24000
-                                current_offset += chunk_duration
-
-                            # Yield the processed chunk (either formatted or raw)
-                            if chunk_data.output is not None:
-                                yield chunk_data
-                            elif chunk_data.audio is not None and len(chunk_data.audio) > 0:
-                                yield chunk_data
-                            else:
-                                logger.warning(
-                                    f"No audio generated for chunk: '{chunk_text[:100]}...'"
-                                )
-
-                        chunk_index += 1  # Increment chunk index after processing text
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}"
-                        )
-                        continue
-
-            # Only finalize if we successfully processed at least one chunk
-            if chunk_index > 0:
+            # Use asyncio.Queue for low-latency streaming
+            chunk_queue = asyncio.Queue()
+            
+            async def producer():
+                """Feed chunks from smart_split to the SubprocessManager."""
+                chunk_index = 0
                 try:
-                    # Empty tokens list to finalize audio
-                    async for chunk_data in self._process_chunk(
-                        "",  # Empty text
-                        [],  # Empty tokens
-                        voice_name,
-                        voice_path,
-                        speed,
-                        writer,
-                        output_format,
-                        is_first=False,
-                        is_last=True,  # Signal this is the last chunk
-                        volume_multiplier=volume_multiplier,
-                        normalizer=stream_normalizer,
-                        lang_code=pipeline_lang_code,  # Pass lang_code
+                    async for chunk_text, tokens, pause_duration_s in smart_split(
+                        text,
+                        lang_code=pipeline_lang_code,
+                        normalization_options=normalization_options,
                     ):
-                        if chunk_data.output is not None:
-                            yield chunk_data
+                        if pause_duration_s is not None and pause_duration_s > 0:
+                            # Put pause chunk directly in queue
+                            await chunk_queue.put(('pause', chunk_index, pause_duration_s, None, None))
+                        elif tokens or chunk_text.strip():
+                            # Feed text chunk to SubprocessManager
+                            args = (chunk_text, (voice_name, voice_path))
+                            kwargs = {
+                                'speed': speed,
+                                'lang_code': pipeline_lang_code,
+                                'return_timestamps': return_timestamps,
+                                'output_format': output_format,
+                                'volume_multiplier': volume_multiplier,
+                            }
+                            self.model_manager.put_chunk(args, kwargs)
+                            # Put processing chunk marker in queue
+                            await chunk_queue.put(('processing', chunk_index, None, chunk_text, tokens))
+                        chunk_index += 1
+                    
+                    # Signal end of input
+                    await chunk_queue.put(('end', None, None, None, None))
                 except Exception as e:
-                    logger.error(f"Failed to finalize audio stream: {str(e)}")
+                    logger.error(f"Producer error: {e}")
+                    await chunk_queue.put(('error', None, None, None, str(e)))
+
+            async def consumer():
+                """Process chunks from queue while getting outputs from SubprocessManager."""
+                processed_count = 0
+                pending_processing_chunks = 0
+                nonlocal current_offset
+                
+                while True:
+                    # Get next item from queue
+                    chunk_type, chunk_index, pause_duration_s, chunk_text, tokens_or_error = await chunk_queue.get()
+                    
+                    if chunk_type == 'pause':
+                        # Handle pause chunk immediately
+                        try:
+                            logger.debug(f"Generating {pause_duration_s}s silence chunk")
+                            silence_samples = int(pause_duration_s * 24000)
+                            silence_audio = np.zeros(silence_samples, dtype=np.int16)
+                            pause_chunk = AudioChunk(audio=silence_audio, word_timestamps=[])
+
+                            if output_format:
+                                formatted_pause_chunk = await AudioService.convert_audio(
+                                    pause_chunk, output_format, writer, speed=speed, chunk_text="",
+                                    is_last_chunk=False, trim_audio=False, normalizer=stream_normalizer,
+                                )
+                                if formatted_pause_chunk.output:
+                                    yield formatted_pause_chunk
+                            else:
+                                if len(pause_chunk.audio) > 0:
+                                    yield pause_chunk
+                            
+                            # Update offset for pause duration
+                            current_offset += pause_duration_s
+                        except Exception as e:
+                            logger.error(f"Failed to process pause chunk: {str(e)}")
+                    
+                    elif chunk_type == 'processing':
+                        # Mark that we have a chunk being processed
+                        pending_processing_chunks += 1
+                        
+                        # Get output from SubprocessManager
+                        while True:
+                            rst = await self.model_manager.get_output()
+                            if rst:
+                                # Handle word timestamps offset  
+                                if rst.word_timestamps is not None:
+                                    for timestamp in rst.word_timestamps:
+                                        timestamp.start_time += current_offset
+                                        timestamp.end_time += current_offset
+
+                                # Update offset based on audio duration
+                                if rst.audio is not None and len(rst.audio) > 0:
+                                    chunk_duration = len(rst.audio) / 24000
+                                    current_offset += chunk_duration
+
+                                # Yield immediately for low latency
+                                if rst.output is not None or (rst.audio is not None and len(rst.audio) > 0):
+                                    yield rst
+                                else:
+                                    logger.warning(f"No audio in processed chunk")
+                            else:
+                                break
+                        
+                        pending_processing_chunks -= 1
+                        processed_count += 1
+                    
+                    elif chunk_type == 'end':
+                        # Wait for any remaining processing chunks
+                        while pending_processing_chunks > 0:
+                            rst = await self.model_manager.get_output()
+                            if rst:
+                                if rst.word_timestamps is not None:
+                                    for timestamp in rst.word_timestamps:
+                                        timestamp.start_time += current_offset
+                                        timestamp.end_time += current_offset
+
+                                if rst.audio is not None and len(rst.audio) > 0:
+                                    chunk_duration = len(rst.audio) / 24000
+                                    current_offset += chunk_duration
+
+                                if rst.output is not None or (rst.audio is not None and len(rst.audio) > 0):
+                                    yield rst
+                                else:
+                                    logger.warning(f"No audio in final processed chunk")
+                            
+                            pending_processing_chunks -= 1
+                            processed_count += 1
+                        break
+                    
+                    elif chunk_type == 'error':
+                        logger.error(f"Processing error: {tokens_or_error}")
+                        break
+
+            # Start producer task
+            producer_task = asyncio.create_task(producer())
+            
+            # Run consumer and yield results
+            async for result in consumer():
+                yield result
+            
+            # Wait for producer to complete
+            await producer_task
 
             self.torch_profiler.stop()
             self.torch_profiler.export_chrome_trace(f"torch_trace_{self.profile_iters}.json.gz")
 
         except Exception as e:
-            logger.error(f"Error in phoneme audio generation: {str(e)}")
+            logger.error(f"Error in audio generation: {str(e)}")
             raise e
 
     async def generate_audio(

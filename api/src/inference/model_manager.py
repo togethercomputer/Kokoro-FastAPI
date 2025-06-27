@@ -1,5 +1,7 @@
 """Kokoro V1 model management."""
 
+import multiprocessing as mp
+import asyncio
 from typing import Optional
 
 from loguru import logger
@@ -9,6 +11,84 @@ from ..core.config import settings
 from ..core.model_config import ModelConfig, model_config
 from .base import BaseModelBackend
 from .kokoro_v1 import KokoroV1
+from .voice_manager import VoiceManager
+
+
+
+async def subprocess_async_run(input_queue: mp.Queue, output_queue: mp.Queue, config: ModelConfig, voice_manager: VoiceManager):
+    manager = ModelManager(config)
+    _ = await manager.initialize_with_warmup(voice_manager)
+    while True:
+        input_data = input_queue.get()
+        if input_data is None:
+            # Signal end of processing
+            output_queue.put(None)
+            break
+        args, kwargs = input_data
+        chunk_text = args[0]
+        speed = kwargs.get("speed", 1.0)
+        output_format = kwargs.pop("output_format", "mp3")
+        volume_multiplier = kwargs.pop("volume_multiplier", 1.0)
+        
+        try:
+            async for result in manager.generate(*args, **kwargs):
+                logger.info("start put...")
+                output_queue.put((chunk_text, result, speed, output_format, volume_multiplier))
+        except Exception as e:
+            logger.error(f"Error processing chunk: {e}")
+            # Still put None to signal end of this chunk
+            output_queue.put(None)
+        
+        # Signal end of this chunk
+        output_queue.put(None)
+
+
+def subprocess_run(input_queue: mp.Queue, output_queue: mp.Queue, config: ModelConfig, voice_manager: VoiceManager):
+    asyncio.run(subprocess_async_run(input_queue, output_queue, config, voice_manager))
+
+
+async def post_process(input_queue: mp.Queue, output_queue: mp.Queue):
+    from ..services.streaming_audio_writer import StreamingAudioWriter
+    from ..services.audio import AudioService, AudioNormalizer
+    writers = {}
+    is_last = False
+    normalizer = AudioNormalizer()
+    while True:
+        input_data = input_queue.get()
+        logger.info("post process get...")
+        if input_data is None:
+            # End of all processing
+            output_queue.put(None)
+            continue
+        chunk_text, chunk_data, speed, output_format, volume_multiplier = input_data
+        if output_format not in writers:
+            writers[output_format] = StreamingAudioWriter(output_format, sample_rate=24000)
+        writer = writers[output_format]
+        chunk_data.audio*=volume_multiplier
+        # For streaming, convert to bytes
+        if output_format:
+            try:
+                chunk_data = await AudioService.convert_audio(
+                    chunk_data,
+                    output_format,
+                    writer,
+                    speed,
+                    chunk_text,
+                    is_last_chunk=is_last,
+                    normalizer=normalizer,
+                )
+                output_queue.put(chunk_data)
+            except Exception as e:
+                logger.error(f"Failed to convert audio: {str(e)}")
+        else:
+            chunk_data = AudioService.trim_audio(
+                chunk_data, chunk_text, speed, is_last, normalizer
+            )
+            output_queue.put(chunk_data)
+
+
+def post_process_async(input_queue: mp.Queue, output_queue: mp.Queue):
+    asyncio.run(post_process(input_queue, output_queue))
 
 
 class ModelManager:
@@ -169,5 +249,47 @@ async def get_manager(config: Optional[ModelConfig] = None) -> ModelManager:
         ModelManager instance
     """
     if ModelManager._instance is None:
-        ModelManager._instance = ModelManager(config)
+        ModelManager._instance = SubprocessManager(config or model_config)
     return ModelManager._instance
+
+
+class SubprocessManager(ModelManager):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        
+        self.ctx = mp.get_context("spawn")
+        self._input_queue = self.ctx.Queue()
+        self._output_queue = self.ctx.Queue()
+        self._post_process_queue = self.ctx.Queue()
+    
+    async def initialize_with_warmup(self, voice_manager: VoiceManager):
+        self._process = self.ctx.Process(target=subprocess_run, args=(self._input_queue, self._post_process_queue, self._config, voice_manager))
+        self._process.start()
+        self._post_process = self.ctx.Process(target=post_process_async, args=(self._post_process_queue, self._output_queue))
+        self._post_process.start()
+        return "cpu", "kokoro_v1", 0
+    
+    async def generate(self, *args, **kwargs):
+        self._input_queue.put((args, kwargs))
+        while True:
+            # Use asyncio.to_thread to run the blocking get() in a thread pool
+            rst = await asyncio.to_thread(self._output_queue.get)
+            if rst:
+                yield rst
+            else:
+                break
+    
+    def put_chunk(self, args, kwargs):
+        """Put a chunk into the input queue for processing."""
+        self._input_queue.put((args, kwargs))
+    
+    async def get_output(self):
+        """Get output from the output queue."""
+        return await asyncio.to_thread(self._output_queue.get)
+    
+    def signal_end_of_input(self):
+        """Signal that no more input will be provided."""
+        self._input_queue.put(None)
+    
+    def get_backend(self):
+        return KokoroV1()
