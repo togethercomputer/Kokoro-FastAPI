@@ -136,7 +136,7 @@ class AudioService:
     }
 
     @staticmethod
-    async def convert_audio(
+    def convert_audio(
         audio_chunk: AudioChunk,
         output_format: str,
         writer: StreamingAudioWriter,
