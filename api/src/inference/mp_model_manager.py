@@ -185,6 +185,7 @@ async def preprocessing_task(pipelines, text, lang_code, normalization_options, 
             for gs, input_ids, tks, graphemes_index in pipeline.preprocess_generate(chunk_text):
                 metadata = dict(
                     tks_len=len(tks),
+                    chunk_text=chunk_text,
                     volume_multiplier=volume_multiplier,
                 )
                 data = ModelInferenceData(request_id, input_ids, voice_list, voice_weights, speed, output_format, data_type, metadata)
@@ -331,10 +332,11 @@ def postprocessing_task(offsets_mapping: Dict, writers: Dict, postprocessing_que
         output = postprocessing_queue.get()
         data_type = output.data_type
         output_format = output.output_format
-        if not output_format in writers:
-            writers[output_format] = StreamingAudioWriter(output_format, sample_rate=24000)
-        writer = writers[output_format]
+       
         request_id = output.request_id
+        if not request_id in writers:
+            writers[request_id] = StreamingAudioWriter(output_format, sample_rate=24000)
+        writer = writers[request_id]
         speed = output.speed
         if request_id not in offsets_mapping:
             offsets_mapping[request_id] = 0.0
@@ -356,7 +358,7 @@ def postprocessing_task(offsets_mapping: Dict, writers: Dict, postprocessing_que
                 output_format,
                 writer,
                 speed,
-                "",  # Empty chunk_text since we don't have the original text
+                output.metadata["chunk_text"],
                 is_last_chunk=False,
                 normalizer=stream_normalizer,
             )
