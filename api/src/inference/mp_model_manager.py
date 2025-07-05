@@ -129,8 +129,9 @@ class SimpleKPipeline(KPipeline):
                     elif len(ps) > 510:
                         logger.warning(f'Truncating len(ps) == {len(ps)} > 510')
                         ps = ps[:510]
-
-                    yield None, ps, None, graphemes_index
+                    input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), ps)))
+                    input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device, non_blocking=True)
+                    yield None, ps, input_ids, None, graphemes_index
 
 
 def preprocess_worker(input_queue, model_queue, postprocessing_queue):
