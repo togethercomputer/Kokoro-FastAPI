@@ -84,7 +84,7 @@ class SimpleKPipeline(KPipeline):
                     input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), ps)))
                     # not sure if cuda tensor can be transferred in a queue here, may need torch multiprocessing queue
                     input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device, non_blocking=True)
-                    yield (gs, input_ids, tks, graphemes_index)
+                    yield (gs, ps, input_ids, tks, graphemes_index)
                     # yield self.Result(graphemes=gs, phonemes=ps, tokens=tks, output=output, text_index=graphemes_index)
             
             # Non-English processing with chunking
@@ -182,9 +182,10 @@ async def preprocessing_task(pipelines, text, lang_code, normalization_options, 
                 pipelines[lang_code] = SimpleKPipeline(lang_code)
             
             pipeline = pipelines[lang_code]
-            for gs, input_ids, tks, graphemes_index in pipeline.preprocess_generate(chunk_text):
+            for gs, ps, input_ids, tks, graphemes_index in pipeline.preprocess_generate(chunk_text):
                 metadata = dict(
-                    tks_len=len(tks),
+                    gs=gs,
+                    ps_len=len(ps),
                     chunk_text=chunk_text,
                     volume_multiplier=volume_multiplier,
                 )
@@ -274,8 +275,7 @@ def model_inference_worker(model_queue, postprocessing_queue, config):
                     continue
                 voice_tensor = load_voice(data.voice_list, data.voice_weights, voice_manager).cuda()
                 
-                ps_len = data.metadata.get("tks_len")
-                print(data.input_ids.shape, voice_tensor.shape, ps_len)
+                ps_len = data.metadata.get("ps_len")
                 audio, pred_dur = model.forward_with_tokens(data.input_ids, voice_tensor[ps_len-1], data.speed)
                 del data.input_ids
                 post_data = PostProcessingData(data.request_id, audio, pred_dur, 0.0, data.output_format, data_type=data.data_type, metadata=data.metadata)
@@ -352,6 +352,7 @@ def postprocessing_task(offsets_mapping: Dict, writers: Dict, postprocessing_que
             offsets_mapping[request_id] += pause_duration_s
         elif data_type == "text":
             chunk_data = AudioChunk(audio=output.audio.cpu().numpy(), word_timestamps=[])
+            del output.audio
             chunk_data.audio *= output.metadata["volume_multiplier"]
             chunk_data = AudioService.convert_audio(
                 chunk_data,
