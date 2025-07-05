@@ -134,14 +134,13 @@ class SimpleKPipeline(KPipeline):
                     yield None, ps, input_ids, None, graphemes_index
 
 
-def preprocess_worker(input_queue, model_queue, postprocessing_queue):
+def preprocess_worker(input_queue, model_queue):
     """Standalone preprocessing function for multiprocessing."""
     pipelines = {}
     while True:
         try:
             request_id, text, voice_name, speed, output_format, lang_code, volume_multiplier, normalization_options, return_timestamps = input_queue.get()
             
-            print("get input")
             # Create event loop for this process
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -149,7 +148,7 @@ def preprocess_worker(input_queue, model_queue, postprocessing_queue):
             # Run preprocessing
             loop.run_until_complete(
                 preprocessing_task(pipelines, text, lang_code, normalization_options, output_format, 
-                                 request_id, voice_name, speed, volume_multiplier, model_queue, postprocessing_queue)
+                                 request_id, voice_name, speed, volume_multiplier, model_queue)
             )
             
         except Exception as e:
@@ -158,11 +157,10 @@ def preprocess_worker(input_queue, model_queue, postprocessing_queue):
             continue
 
 
-async def preprocessing_task(pipelines, text, lang_code, normalization_options, output_format, request_id, voice_name, speed, volume_multiplier, model_queue, postprocessing_queue):
+async def preprocessing_task(pipelines, text, lang_code, normalization_options, output_format, request_id, voice_name, speed, volume_multiplier, model_queue):
     """Async preprocessing task."""
     chunk_index = 0
     voice_list, voice_weights = get_voice_list(voice_name)
-    # print(text, lang_code, normalization_options, output_format, request_id, voice_name, speed, volume_multiplier)
     
     async for chunk_text, tokens, pause_duration_s in smart_split(
         text,
@@ -260,15 +258,18 @@ def model_inference_worker(model_queue, postprocessing_queue, config):
     model.to(settings.get_device())
     
     fair_queue = FairRequestQueue()
+    max_reqs = 5
     
     while True:
         try:
+            num_reqs = 0
             # Get all requests from model queue, sort them in a priority queue
             while not model_queue.empty():
                 request = model_queue.get()
                 fair_queue.add_request(request)
 
-            while not fair_queue.empty():
+            while not fair_queue.empty() and num_reqs < max_reqs:
+                num_reqs += 1
                 data = fair_queue.pop_request()
                 if data.data_type != "text":
                     post_data = PostProcessingData(data.request_id, None, None, data.metadata.get("pause_duration_s", 0.0), data.output_format, data_type=data.data_type)
@@ -430,7 +431,7 @@ class SubProcessModelManager:
             ctx = mp.get_context("spawn")
             self.preprocess_process = ctx.Process(
                 target=preprocess_worker,
-                args=(self.input_queue, self.model_queue, self.postprocessing_queue)
+                args=(self.input_queue, self.model_queue)
             )
             self.model_inference_process = ctx.Process(
                 target=model_inference_worker,
