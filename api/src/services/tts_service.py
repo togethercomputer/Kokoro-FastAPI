@@ -18,7 +18,6 @@ from loguru import logger
 from ..core.config import settings
 from ..inference.base import AudioChunk
 from ..inference.kokoro_v1 import KokoroV1
-from ..inference.mp_model_manager import get_manager as get_mp_model_manager
 from ..inference.voice_manager import get_manager as get_voice_manager
 from ..structures.schemas import NormalizationOptions
 from .audio import AudioNormalizer, AudioService
@@ -66,9 +65,11 @@ class TTSService:
     async def create(cls, output_dir: str = None) -> "TTSService":
         """Create and initialize TTSService instance."""
         service = cls(output_dir)
+        from ..inference.mp_model_manager import get_manager as get_mp_model_manager
         service.model_manager = await get_mp_model_manager(input_queue=service.input_queue, output_queue=service.output_queue)
-        # service._voice_manager = await get_voice_manager()
+        service._voice_manager = await get_voice_manager()
         # Start the check loop thread
+        await service.model_manager.initialize()
         service.start_check_loop()
         return service
 
@@ -254,6 +255,7 @@ class TTSService:
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
         request_id = self.num_requests
+        print(f"request_id: {request_id}")
         self.num_requests += 1
         self.output_queues[request_id] = asyncio.Queue()
 
@@ -267,9 +269,10 @@ class TTSService:
         logger.info(
             f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream"
         )
-        self.input_queue.put((request_id, text, voice_name, voice_path, speed, output_format, lang_code, volume_multiplier, normalization_options, return_timestamps))
+        self.input_queue.put((request_id, text, voice_name, speed, output_format, pipeline_lang_code, volume_multiplier, normalization_options, return_timestamps))
 
         try:
+            items = 0
             while True:
                 # Get item from the async queue for this request
                 chunk_data = await self.output_queues[request_id].get()
@@ -277,9 +280,10 @@ class TTSService:
                 # Check if this is a sentinel value to stop the generator
                 if chunk_data is None:
                     break
-                    
+                items += 1
                 yield chunk_data
                 await asyncio.sleep(0)
+
         finally:
             # Clean up the queue when done
             if request_id in self.output_queues:

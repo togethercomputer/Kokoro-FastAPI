@@ -7,6 +7,7 @@ from typing import Any
 class ChunkSet:
     def __init__(self, request) -> None:
         self.chunks = [request]
+        self.request_id = request.request_id
         self.arrival_time = time.time()
     
     def add_chunk(self, chunk) -> None:
@@ -30,12 +31,12 @@ class FairRequestQueue:
     
     def add_request(self, request) -> None:
         # TODO: consider fairness and complete time?
-        if request.id not in self.requests:
-            self.requests[request.id] = ChunkSet(request)
-            self.processed_chunks[request.id] = 0
-            heapq.heappush(self._heap, (self.processed_chunks[request.id], self.requests[request.id]))
+        if request.request_id not in self.requests:
+            self.requests[request.request_id] = ChunkSet(request)
+            self.processed_chunks[request.request_id] = 0
+            heapq.heappush(self._heap, (self.processed_chunks[request.request_id], self.requests[request.request_id]))
         else:
-            self.requests[request.id].add_chunk(request)
+            self.requests[request.request_id].add_chunk(request)
         
     def pop_request(self):
         if not self._heap:
@@ -43,11 +44,11 @@ class FairRequestQueue:
         _, request = heapq.heappop(self._heap)
         rst = request.pop_chunk()
         if request.chunks:
-            self.processed_chunks[request.id] += 1
-            heapq.heappush(self._heap, (self.processed_chunks[request.id], self.requests[request.id]))
+            self.processed_chunks[request.request_id] += 1
+            heapq.heappush(self._heap, (self.processed_chunks[request.request_id], self.requests[request.request_id]))
         else:
-            self.requests.pop(request.id)
-            self.processed_chunks.pop(request.id)
+            self.requests.pop(request.request_id)
+            self.processed_chunks.pop(request.request_id)
         return rst
     
     def empty(self) -> bool:
