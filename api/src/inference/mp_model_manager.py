@@ -135,26 +135,69 @@ class SimpleKPipeline(KPipeline):
 
 
 def preprocess_worker(input_queue, model_queue):
-    """Standalone preprocessing function for multiprocessing."""
-    pipelines = {}
-    while True:
-        try:
-            request_id, text, voice_name, speed, output_format, lang_code, volume_multiplier, normalization_options, return_timestamps = input_queue.get()
-            
-            # Create event loop for this process
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Run preprocessing
-            loop.run_until_complete(
-                preprocessing_task(pipelines, text, lang_code, normalization_options, output_format, 
-                                 request_id, voice_name, speed, volume_multiplier, model_queue)
-            )
-            
-        except Exception as e:
-            raise e
-            logger.error(f"Error in preprocess_worker: {e}")
-            continue
+    """Standalone preprocessing function for multiprocessing with concurrent request handling."""
+    import queue
+    
+    # Create event loop for this process
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def concurrent_preprocessing():
+        """Main async function that handles concurrent preprocessing."""
+        pipelines = {}
+        active_tasks = set()
+        
+        async def handle_single_request(request_id, text, voice_name, speed, output_format, 
+                                      lang_code, volume_multiplier, normalization_options, return_timestamps):
+            """Handle a single preprocessing request concurrently."""
+            try:
+                await preprocessing_task(pipelines, text, lang_code, normalization_options, output_format, 
+                                       request_id, voice_name, speed, volume_multiplier, model_queue)
+                logger.debug(f"Completed preprocessing for request {request_id}")
+            except Exception as e:
+                logger.error(f"Error in preprocessing request {request_id}: {e}")
+        
+        while True:
+            try:
+                try:
+                    request_data = input_queue.get_nowait()
+                    request_id, text, voice_name, speed, output_format, lang_code, volume_multiplier, normalization_options, return_timestamps = request_data
+                    
+                    logger.debug(f"Starting preprocessing for request {request_id}")
+                    
+                    task = asyncio.create_task(
+                        handle_single_request(request_id, text, voice_name, speed, output_format, 
+                                            lang_code, volume_multiplier, normalization_options, return_timestamps)
+                    )
+                    active_tasks.add(task)
+                    task.add_done_callback(active_tasks.discard)
+                    
+                except queue.Empty:
+                    await asyncio.sleep(0.001)
+                
+                active_tasks = {task for task in active_tasks if not task.done()}
+                
+                max_concurrent = 50
+                if len(active_tasks) >= max_concurrent:
+                    if active_tasks:
+                        done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        active_tasks = pending
+                
+            except Exception as e:
+                logger.error(f"Error in preprocess_worker main loop: {e}")
+                await asyncio.sleep(0.1)
+    
+    try:
+        loop.run_until_complete(concurrent_preprocessing())
+    except KeyboardInterrupt:
+        logger.info("Preprocess worker shutting down...")
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    finally:
+        loop.close()
 
 
 async def preprocessing_task(pipelines, text, lang_code, normalization_options, output_format, request_id, voice_name, speed, volume_multiplier, model_queue):
