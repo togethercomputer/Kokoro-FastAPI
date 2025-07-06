@@ -289,7 +289,7 @@ def get_voice_list(voice_name) -> tuple[List[str], List[float]]:
     return voice_list, voice_weights
 
 
-def model_inference_worker(model_queue, postprocessing_queue, config):
+def model_inference_worker(model_queue, postprocessing_queues, config):
     """Standalone model inference function for multiprocessing."""
     voice_manager = get_manager_sync()
     model_path = config.pytorch_kokoro_v1_file
@@ -302,6 +302,7 @@ def model_inference_worker(model_queue, postprocessing_queue, config):
     
     fair_queue = FairRequestQueue()
     max_reqs = 5
+    num_postprocessing_queues = len(postprocessing_queues)
     
     while True:
         try:
@@ -316,7 +317,9 @@ def model_inference_worker(model_queue, postprocessing_queue, config):
                 data = fair_queue.pop_request()
                 if data.data_type != "text":
                     post_data = PostProcessingData(data.request_id, None, None, data.metadata.get("pause_duration_s", 0.0), data.output_format, data_type=data.data_type)
-                    postprocessing_queue.put(post_data)
+                    # Select corresponding postprocessing queue based on request_id
+                    queue_index = data.request_id % num_postprocessing_queues
+                    postprocessing_queues[queue_index].put(post_data)
                     continue
                 voice_tensor = load_voice(data.voice_list, data.voice_weights, voice_manager).cuda()
                 
@@ -324,7 +327,9 @@ def model_inference_worker(model_queue, postprocessing_queue, config):
                 audio, pred_dur = model.forward_with_tokens(data.input_ids, voice_tensor[ps_len-1], data.speed)
                 del data.input_ids
                 post_data = PostProcessingData(data.request_id, audio, pred_dur, 0.0, data.output_format, data_type=data.data_type, metadata=data.metadata)
-                postprocessing_queue.put(post_data)
+                # Select corresponding postprocessing queue based on request_id
+                queue_index = data.request_id % num_postprocessing_queues
+                postprocessing_queues[queue_index].put(post_data)
         except Exception as e:
             raise e
             logger.error(f"Error in model_inference_worker: {e}")
@@ -455,7 +460,9 @@ class SubProcessModelManager:
         self._backend: Optional[KokoroV1] = None  # Explicitly type as KokoroV1
         self._device: Optional[str] = None
         ctx = mp.get_context("spawn")
-        self.postprocessing_queue = ctx.Queue()
+        # Create multiple postprocessing queues
+        self.num_postprocessing_queues = settings.num_postprocessing_queues
+        self.postprocessing_queues = [ctx.Queue() for _ in range(self.num_postprocessing_queues)]
         self.model_queue = ctx.Queue()
         self.fair_queue = FairRequestQueue()
         self.input_queue = input_queue
@@ -478,15 +485,24 @@ class SubProcessModelManager:
             )
             self.model_inference_process = ctx.Process(
                 target=model_inference_worker,
-                args=(self.model_queue, self.postprocessing_queue, self._config)
+                args=(self.model_queue, self.postprocessing_queues, self._config)
             )
-            self.postprocessing_process = ctx.Process(
-                target=postprocessing_worker,
-                args=(self.postprocessing_queue, self.result_queue)
-            )
+            # Create multiple postprocessing processes, each handling one queue
+            self.postprocessing_processes = []
+            for i in range(self.num_postprocessing_queues):
+                process = ctx.Process(
+                    target=postprocessing_worker,
+                    args=(self.postprocessing_queues[i], self.result_queue)
+                )
+                self.postprocessing_processes.append(process)
+            
+            # Start all processes
             self.preprocess_process.start()
             self.model_inference_process.start()
-            self.postprocessing_process.start()
+            for process in self.postprocessing_processes:
+                process.start()
+            
+            logger.info(f"Started {self.num_postprocessing_queues} postprocessing processes")
 
         except Exception as e:
             raise e
