@@ -17,7 +17,7 @@ attrs==24.3.0
     #   referencing
 babel==2.16.0
     # via csvw
-certifi==2024.12.14
+certifi==2026.10.19
     # via
     #   httpcore
     #   httpx
