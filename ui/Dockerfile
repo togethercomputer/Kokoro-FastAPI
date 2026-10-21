@@ -2,6 +2,10 @@ FROM python:3.10-slim
 
 WORKDIR /app/ui
 
+# Pick up the latest ca-certificates (CVE-2026-111943)
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
 RUN pip install gradio==5.9.1 requests==2.32.3
 

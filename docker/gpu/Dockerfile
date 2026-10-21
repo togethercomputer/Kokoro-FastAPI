@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and other dependencies
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     python3.10 \
     python3-venv \
     espeak-ng \

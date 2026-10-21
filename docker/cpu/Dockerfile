@@ -2,6 +2,7 @@ FROM python:3.10-slim
 
 # Install dependencies and check espeak location
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     espeak-ng \
     espeak-ng-data \
     git \
