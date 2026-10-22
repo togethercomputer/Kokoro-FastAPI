@@ -41,6 +41,12 @@ spec:
               value: "true"
             - name: PYTHONUNBUFFERED
               value: "1"
+            {{- if .Values.caBundle.enabled }}
+            - name: SSL_CERT_FILE
+              value: /etc/ssl/certs/ca-certificates.crt
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/ssl/certs/ca-certificates.crt
+            {{- end }}
           ports:
             - name: kokoro-tts-http
               containerPort: {{ .Values.kokoroTTS.port | default 8880 }}
@@ -61,8 +67,23 @@ spec:
             timeoutSeconds: 5
           resources:
             {{- toYaml .Values.kokoroTTS.resources | nindent 12 }}
+          {{- if .Values.caBundle.enabled }}
+          volumeMounts:
+            - name: ca-bundle
+              mountPath: /etc/ssl/certs/ca-certificates.crt
+              subPath: ca-certificates.crt
+              readOnly: true
+          {{- else }}
           volumeMounts: []
+          {{- end }}
+      {{- if .Values.caBundle.enabled }}
+      volumes:
+        - name: ca-bundle
+          configMap:
+            name: {{ include "kokoro-fastapi.fullname" . }}-ca-bundle
+      {{- else }}
       volumes: []
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
