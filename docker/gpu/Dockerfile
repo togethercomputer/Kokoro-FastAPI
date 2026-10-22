@@ -1,4 +1,11 @@
 FROM --platform=$BUILDPLATFORM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
+# Upgrade ca-certificates from noble-security (CVE-2026-111943) and fail if still old
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && v="$(dpkg-query -W -f='${Version}' ca-certificates)" \
+ && dpkg --compare-versions "$v" ge 20260816~ \
+ || { echo "ca-certificates ${v:-missing} is older than 20260816" >&2; exit 1; }
 # Set non-interactive frontend
 ENV DEBIAN_FRONTEND=noninteractive
 
