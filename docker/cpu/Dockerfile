@@ -1,7 +1,8 @@
-FROM python:3.10-slim 
+FROM python:3.11-slim
 
 # Install dependencies and check espeak location
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     espeak-ng \
     espeak-ng-data \
     git \
@@ -36,7 +37,7 @@ ENV PATH="/home/appuser/.cargo/bin:$PATH"
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv --python 3.10 && \
+    uv venv --python 3.11 && \
     uv sync --extra cpu
 
 # Copy project files including models

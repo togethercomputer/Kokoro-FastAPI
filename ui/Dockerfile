@@ -1,9 +1,15 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app/ui
 
+# Pick up the latest ca-certificates (CVE-2026-111943)
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
-RUN pip install gradio==5.9.1 requests==2.32.3
+# gradio caps pillow<13; the UI uses no image components, so take the patched pillow
+RUN pip install --no-cache-dir gradio==6.16.0 requests==2.33.0 \
+    && pip install --no-cache-dir --no-deps "pillow>=13.0.0"
 
 # Create necessary directories
 RUN mkdir -p data/inputs data/outputs

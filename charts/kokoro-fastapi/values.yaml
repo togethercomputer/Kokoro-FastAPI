@@ -15,6 +15,12 @@ kokoroTTS:
     requests:
       nvidia.com/gpu: 1
 
+# Mount a current CA bundle (files/ca-certificates.crt, from Alpine 3.23
+# ca-certificates 20261020-r0) over the image's system bundle until the
+# upstream image ships fixed ca-certificates (CVE-2026-111943).
+caBundle:
+  enabled: true
+
 nameOverride: ""
 fullnameOverride: ""
 

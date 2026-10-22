@@ -1,0 +1,11 @@
+{{- if .Values.caBundle.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kokoro-fastapi.fullname" . }}-ca-bundle
+  labels:
+    {{- include "kokoro-fastapi.labels" . | nindent 4 }}
+data:
+  ca-certificates.crt: |-
+{{ .Files.Get "files/ca-certificates.crt" | indent 4 }}
+{{- end }}

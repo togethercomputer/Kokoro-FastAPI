@@ -1,6 +1,6 @@
 # Primarily for reference, as Dockerfile refer
 # Core dependencies
-fastapi==0.115.6
+fastapi>=0.115.6
 uvicorn==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
@@ -8,7 +8,7 @@ python-dotenv==1.0.1
 sqlalchemy==2.0.27
 
 # ML/DL
-transformers==4.47.1
+transformers>=5.10.1
 numpy>=1.26.0  # Version managed by PyTorch dependencies
 scipy==1.14.1
 onnxruntime==1.20.1
@@ -18,7 +18,7 @@ soundfile==0.13.0
 
 # Text processing
 phonemizer==3.3.0
-regex==2024.11.6
+regex>=2024.11.6
 
 # Utilities
 aiofiles==23.2.1  # Last version before Windows path handling changes
@@ -32,3 +32,14 @@ loguru==0.7.3
 pytest==8.0.0
 httpx==0.26.0
 pytest-asyncio==0.23.5
+
+# Security floors for transitive dependencies
+anyio>=4.14.2
+h11>=0.16.0
+urllib3>=2.8.0
+protobuf>=5.29.6,<6
+starlette>=1.3.1
+lxml>=6.1.0
+markdown>=3.8.1
+fsspec>=2026.6.0
+certifi>=2026.10.19

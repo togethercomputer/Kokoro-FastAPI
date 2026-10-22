@@ -1,9 +1,17 @@
 FROM --platform=$BUILDPLATFORM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
+# Upgrade ca-certificates from noble-security (CVE-2026-111943) and fail if still old
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && v="$(dpkg-query -W -f='${Version}' ca-certificates)" \
+ && dpkg --compare-versions "$v" ge 20260816~ \
+ || { echo "ca-certificates ${v:-missing} is older than 20260816" >&2; exit 1; }
 # Set non-interactive frontend
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and other dependencies
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     python3.10 \
     python3-venv \
     espeak-ng \
@@ -39,7 +47,7 @@ ENV PHONEMIZER_ESPEAK_PATH=/usr/bin \
 
 # Install dependencies with GPU extras (using cache mounts)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv --python 3.10 && \
+    uv venv --python 3.11 && \
     uv sync --extra gpu
 
 # Copy project files including models
